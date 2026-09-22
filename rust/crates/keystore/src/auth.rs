@@ -15,6 +15,12 @@ pub enum AuthIntent {
     AuthorizePayment {
         message: String,
         limit: Option<PaymentLimit>,
+        /// The exact amount, or the ceiling for an allowance, in USD
+        /// ten-thousandths ([`USD_MINOR_UNITS_PER_DOLLAR`]), when known. A
+        /// spending policy reads this; a prompt reads `message`.
+        amount_minor_units: Option<u64>,
+        /// True when one approval creates authority for future merchant pulls.
+        recurring: bool,
     },
     CreateAccount(String),
     ImportAccount(String),
@@ -31,8 +37,14 @@ pub enum AuthIntent {
     AuthorizeBatch {
         message: String,
         limit: Option<PaymentLimit>,
+        /// Worst-case total the permit may sign, in USD ten-thousandths.
+        amount_minor_units: Option<u64>,
     },
 }
+
+/// `$1.00` is 10 000 minor units: fine enough for micropayments, integral
+/// for every stablecoin decimal pay handles.
+pub const USD_MINOR_UNITS_PER_DOLLAR: u64 = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaymentLimit {
@@ -157,6 +169,8 @@ impl AuthIntent {
         Self::AuthorizePayment {
             message: format!("authorize payment of {amount} for {description}"),
             limit: PaymentLimit::from_amount(amount),
+            amount_minor_units: parse_usd_minor_units(amount),
+            recurring: false,
         }
     }
 
@@ -169,6 +183,22 @@ impl AuthIntent {
                 operator,
             ),
             limit: PaymentLimit::from_amount(amount),
+            amount_minor_units: parse_usd_minor_units(amount),
+            recurring: false,
+        }
+    }
+
+    pub fn authorize_subscription(amount: &str, reason: &str, operator: &str) -> Self {
+        Self::AuthorizePayment {
+            message: payment_authorization_message(
+                PaymentAmountKind::Exact,
+                amount,
+                Some(reason),
+                operator,
+            ),
+            limit: PaymentLimit::from_amount(amount),
+            amount_minor_units: parse_usd_minor_units(amount),
+            recurring: true,
         }
     }
 
@@ -189,15 +219,24 @@ impl AuthIntent {
                 operator,
             ),
             limit: PaymentLimit::from_amount(amount),
+            amount_minor_units: parse_usd_minor_units(amount),
+            recurring: false,
         }
     }
 
     pub fn with_account_context(&self, account: &str) -> Self {
         let account = prompt_detail(account);
         match self {
-            Self::AuthorizePayment { message, limit } => Self::AuthorizePayment {
+            Self::AuthorizePayment {
+                message,
+                limit,
+                amount_minor_units,
+                recurring,
+            } => Self::AuthorizePayment {
                 message: payment_message_with_account(message, &account),
                 limit: *limit,
+                amount_minor_units: *amount_minor_units,
+                recurring: *recurring,
             },
             other => other.clone(),
         }
@@ -207,6 +246,8 @@ impl AuthIntent {
         Self::AuthorizePayment {
             message: "authorize a payment with pay".to_string(),
             limit: None,
+            amount_minor_units: None,
+            recurring: false,
         }
     }
 
@@ -214,6 +255,8 @@ impl AuthIntent {
         Self::AuthorizePayment {
             message: format!("authorize sending SOL to {recipient}"),
             limit: None,
+            amount_minor_units: None,
+            recurring: false,
         }
     }
 
@@ -246,6 +289,9 @@ impl AuthIntent {
                 operator,
             ),
             limit: amount.and_then(PaymentLimit::from_amount),
+            // The allowance is what may leave the account; a policy judges that.
+            amount_minor_units: parse_usd_minor_units(limit),
+            recurring: false,
         }
     }
 
@@ -283,6 +329,7 @@ impl AuthIntent {
         Self::AuthorizeBatch {
             message,
             limit: PaymentLimit::from_amount(max_total_usd),
+            amount_minor_units: parse_usd_minor_units(max_total_usd),
         }
     }
 
@@ -299,7 +346,12 @@ impl AuthIntent {
             || lower.starts_with("authorize sending")
         {
             let limit = payment_limit_from_message(&message);
-            Self::AuthorizePayment { message, limit }
+            Self::AuthorizePayment {
+                message,
+                limit,
+                amount_minor_units: None,
+                recurring: false,
+            }
         } else if lower.starts_with("set up") || lower.starts_with("store keypair") {
             Self::CreateAccount(message)
         } else if lower.starts_with("import") {
@@ -336,6 +388,41 @@ impl AuthIntent {
             Self::AuthorizePayment { limit, .. } | Self::AuthorizeBatch { limit, .. } => *limit,
             _ => None,
         }
+    }
+
+    /// The money this intent may move, in USD ten-thousandths, when the
+    /// intent names it. `None` for non-payment intents and for payments
+    /// whose amount was not known when the prompt was built.
+    pub fn amount_minor_units(&self) -> Option<u64> {
+        match self {
+            Self::AuthorizePayment {
+                amount_minor_units, ..
+            }
+            | Self::AuthorizeBatch {
+                amount_minor_units, ..
+            } => *amount_minor_units,
+            _ => None,
+        }
+    }
+
+    /// Whether approving this intent lets money leave the account.
+    pub fn moves_money(&self) -> bool {
+        matches!(
+            self,
+            Self::AuthorizePayment { .. } | Self::AuthorizeBatch { .. }
+        )
+    }
+
+    /// Whether this approval delegates authority for later charges that do
+    /// not pass through this process again.
+    pub fn is_recurring(&self) -> bool {
+        matches!(
+            self,
+            Self::AuthorizePayment {
+                recurring: true,
+                ..
+            }
+        )
     }
 
     #[cfg(any(test, target_os = "macos", target_os = "windows"))]
@@ -806,6 +893,31 @@ mod tests {
                 .payment_limit(),
             Some(PaymentLimit::Usd1)
         );
+    }
+
+    #[test]
+    fn payment_intents_carry_their_amount_in_minor_units() {
+        assert_eq!(
+            AuthIntent::authorize_payment("$1.00", "x").amount_minor_units(),
+            Some(10_000)
+        );
+        assert_eq!(
+            AuthIntent::authorize_payment_details("$0.045", "x", "op").amount_minor_units(),
+            Some(450)
+        );
+        assert_eq!(
+            AuthIntent::authorize_channel_escrow("$25.00", "x", "op").amount_minor_units(),
+            Some(250_000)
+        );
+        assert_eq!(
+            AuthIntent::authorize_spend_up_to(Some("$0.10"), "$5.00", "op").amount_minor_units(),
+            Some(50_000),
+            "an allowance is judged by its ceiling"
+        );
+        assert_eq!(AuthIntent::default_payment().amount_minor_units(), None);
+        assert_eq!(AuthIntent::create_account("a").amount_minor_units(), None);
+        assert!(AuthIntent::default_payment().moves_money());
+        assert!(!AuthIntent::create_account("a").moves_money());
     }
 
     #[test]
