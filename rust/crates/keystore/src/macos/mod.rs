@@ -2,10 +2,12 @@
 
 use crate::{AuthGate, AuthIntent, Error, Result, SecretStore, Zeroizing};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const HELPER_SOURCE: &str = include_str!("helper.swift");
@@ -14,6 +16,7 @@ const SWIFTC: &str = "/usr/bin/swiftc";
 const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(2);
 const HELPER_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const MAX_HELPER_OUTPUT_BYTES: usize = 1024 * 1024;
 
 // Security/AuthSession.h: query the calling process's security session, not
 // another user's console session. An SSH session can have enrolled biometrics
@@ -498,8 +501,8 @@ fn helper_run(args: &[&str]) -> Result<String> {
     }
 }
 
-/// Bound a helper call even if LocalAuthentication never calls back. On expiry
-/// the child must be killed and reaped, or the biometric prompt remains alive.
+/// Bound a helper call even if LocalAuthentication never calls back. Drain both
+/// pipes as it runs so a full pipe cannot block the helper from exiting.
 fn bounded_helper_output(
     binary: &Path,
     args: &[&str],
@@ -514,36 +517,84 @@ fn bounded_helper_output(
         .spawn()
         .map_err(|e| Error::Backend(format!("pay.sh: {e}")))?;
 
+    let oversized = Arc::new(AtomicBool::new(false));
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let stdout_limit = Arc::clone(&oversized);
+    let stderr_limit = Arc::clone(&oversized);
+    let stdout_reader = std::thread::spawn(move || drain_helper_pipe(stdout, stdout_limit));
+    let stderr_reader = std::thread::spawn(move || drain_helper_pipe(stderr, stderr_limit));
+
     let started = Instant::now();
-    loop {
+    let status = loop {
+        if oversized.load(Ordering::Relaxed) {
+            break Err(Error::Backend(format!(
+                "{operation} exceeded the {MAX_HELPER_OUTPUT_BYTES}-byte output limit"
+            )));
+        }
         match child.try_wait() {
-            Ok(Some(_)) => {
-                return child
-                    .wait_with_output()
-                    .map_err(|e| Error::Backend(format!("pay.sh: {e}")));
-            }
+            Ok(Some(status)) => break Ok(status),
             Ok(None) if started.elapsed() >= timeout => {
-                let killed = child.kill();
-                let reaped = child.wait();
-                if let Err(e) = killed {
-                    return Err(Error::Backend(format!(
-                        "{operation} timed out; failed to stop pay.sh: {e}"
-                    )));
-                }
-                reaped.map_err(|e| Error::Backend(format!("Failed to reap pay.sh: {e}")))?;
-                return Err(Error::Backend(format!(
+                break Err(Error::Backend(format!(
                     "{operation} timed out after {} seconds; the local approval prompt may not be visible",
                     timeout.as_secs()
                 )));
             }
             Ok(None) => std::thread::sleep(HELPER_POLL_INTERVAL),
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(Error::Backend(format!("pay.sh: {e}")));
+            Err(e) => break Err(Error::Backend(format!("pay.sh: {e}"))),
+        }
+    };
+
+    if status.is_err() {
+        if let Err(e) = child.kill() {
+            // The helper may have exited between try_wait and kill.
+            if child.try_wait().ok().flatten().is_none() {
+                return Err(Error::Backend(format!(
+                    "{operation}: failed to stop pay.sh: {e}"
+                )));
             }
         }
+        child
+            .wait()
+            .map_err(|e| Error::Backend(format!("Failed to reap pay.sh: {e}")))?;
     }
+
+    let stdout = join_helper_reader(stdout_reader)?;
+    let stderr = join_helper_reader(stderr_reader)?;
+    let status = status?;
+    if oversized.load(Ordering::Relaxed) {
+        return Err(Error::Backend(format!(
+            "{operation} exceeded the {MAX_HELPER_OUTPUT_BYTES}-byte output limit"
+        )));
+    }
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn drain_helper_pipe(mut pipe: impl Read, oversized: Arc<AtomicBool>) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut chunk = [0; 8192];
+    loop {
+        let count = pipe.read(&mut chunk)?;
+        if count == 0 {
+            return Ok(output);
+        }
+        if output.len() + count > MAX_HELPER_OUTPUT_BYTES {
+            oversized.store(true, Ordering::Relaxed);
+            return Ok(output);
+        }
+        output.extend_from_slice(&chunk[..count]);
+    }
+}
+
+fn join_helper_reader(reader: std::thread::JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| Error::Backend("pay.sh output reader panicked".to_string()))?
+        .map_err(|e| Error::Backend(format!("Failed to read pay.sh output: {e}")))
 }
 
 /// Detect Apple Keychain / LocalAuthentication "user cancelled" messages.
@@ -631,6 +682,63 @@ mod tests {
         )
         .expect("failed helper should return its status");
         assert!(!output.status.success());
+    }
+
+    #[test]
+    fn bounded_helper_drains_large_stdout_and_stderr() {
+        let dir = test_dir("large-output");
+        let script = dir.path().join("output.sh");
+        let source = dir.path().join("data");
+        fs::write(&source, vec![b'x'; 256 * 1024]).expect("write test output");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n/bin/cat '{}'\n/bin/cat '{}' >&2\n",
+                source.display(),
+                source.display()
+            ),
+        )
+        .expect("write test helper");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
+            .expect("set helper permissions");
+
+        let output = bounded_helper_output(&script, &[], Duration::from_secs(10), "test helper")
+            .expect("finite output larger than pipe capacity should complete");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 256 * 1024);
+        assert_eq!(output.stderr.len(), 256 * 1024);
+    }
+
+    #[test]
+    fn bounded_helper_rejects_output_over_limit() {
+        let dir = test_dir("oversized-output");
+        let script = dir.path().join("output.sh");
+        let source = dir.path().join("data");
+        let pid_file = dir.path().join("pid");
+        fs::write(&source, vec![b'x'; MAX_HELPER_OUTPUT_BYTES + 1]).expect("write test output");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec /bin/cat '{}'\n",
+                pid_file.display(),
+                source.display()
+            ),
+        )
+        .expect("write test helper");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
+            .expect("set helper permissions");
+
+        let err = bounded_helper_output(&script, &[], Duration::from_secs(10), "test helper")
+            .expect_err("oversized helper output must be rejected");
+        assert!(err.to_string().contains("output limit"));
+
+        let pid = fs::read_to_string(&pid_file).expect("helper started");
+        let still_running = Command::new("/bin/kill")
+            .args(["-0", pid.trim()])
+            .status()
+            .expect("probe helper PID")
+            .success();
+        assert!(!still_running, "oversized helper must be reaped");
     }
 
     #[test]
