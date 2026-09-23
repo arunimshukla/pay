@@ -5,12 +5,47 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const HELPER_SOURCE: &str = include_str!("helper.swift");
 const CODESIGN: &str = "/usr/bin/codesign";
 const SWIFTC: &str = "/usr/bin/swiftc";
+const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
+const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(2);
+const HELPER_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+// Security/AuthSession.h: query the calling process's security session, not
+// another user's console session. An SSH session can have enrolled biometrics
+// without a local graphical prompt path.
+const CALLER_SECURITY_SESSION: u32 = u32::MAX;
+const SESSION_HAS_GRAPHIC_ACCESS: u32 = 0x0010;
+const SESSION_IS_REMOTE: u32 = 0x1000;
+
+#[link(name = "Security", kind = "framework")]
+unsafe extern "C" {
+    fn SessionGetInfo(session: u32, session_id: *mut u32, attributes: *mut u32) -> i32;
+}
+
+fn has_local_graphical_session() -> bool {
+    let mut attributes = 0;
+    // SAFETY: SessionGetInfo writes to `attributes`; the optional session ID
+    // output is null, and the caller-session constant is defined by Security.
+    let status = unsafe {
+        SessionGetInfo(
+            CALLER_SECURITY_SESSION,
+            std::ptr::null_mut(),
+            &mut attributes,
+        )
+    };
+    session_can_show_touch_id(status, attributes)
+}
+
+fn session_can_show_touch_id(status: i32, attributes: u32) -> bool {
+    status == 0
+        && attributes & SESSION_HAS_GRAPHIC_ACCESS != 0
+        && attributes & SESSION_IS_REMOTE == 0
+}
 
 const ENTITLEMENTS_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -24,12 +59,20 @@ pub struct TouchId;
 
 impl AuthGate for TouchId {
     fn authenticate(&self, intent: &AuthIntent) -> Result<()> {
+        if !has_local_graphical_session() {
+            return Err(Error::AuthDenied(
+                "Touch ID approval requires a local graphical macOS session; no payment was signed"
+                    .to_string(),
+            ));
+        }
         let binary = helper_path()?;
         let message = intent.prompt_message();
-        let output = Command::new(&binary)
-            .args(["authenticate", &message])
-            .output()
-            .map_err(|e| Error::Backend(format!("pay.sh: {e}")))?;
+        let output = bounded_helper_output(
+            &binary,
+            &["authenticate", &message],
+            AUTH_TIMEOUT,
+            "Touch ID authentication",
+        )?;
 
         if output.status.success() {
             Ok(())
@@ -44,13 +87,19 @@ impl AuthGate for TouchId {
     }
 
     fn is_available(&self) -> bool {
+        if !has_local_graphical_session() {
+            return false;
+        }
         helper_path()
             .ok()
             .and_then(|binary| {
-                Command::new(&binary)
-                    .args(["check-biometrics"])
-                    .output()
-                    .ok()
+                bounded_helper_output(
+                    &binary,
+                    &["check-biometrics"],
+                    AVAILABILITY_TIMEOUT,
+                    "Touch ID availability check",
+                )
+                .ok()
             })
             .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "yes")
             .unwrap_or(false)
@@ -435,10 +484,7 @@ fn current_euid() -> u32 {
 
 fn helper_run(args: &[&str]) -> Result<String> {
     let binary = helper_path()?;
-    let output = Command::new(&binary)
-        .args(args)
-        .output()
-        .map_err(|e| Error::Backend(format!("pay.sh: {e}")))?;
+    let output = bounded_helper_output(&binary, args, AUTH_TIMEOUT, "Keychain helper")?;
 
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -448,6 +494,54 @@ fn helper_run(args: &[&str]) -> Result<String> {
             Err(Error::AuthDenied(err))
         } else {
             Err(Error::Backend(err))
+        }
+    }
+}
+
+/// Bound a helper call even if LocalAuthentication never calls back. On expiry
+/// the child must be killed and reaped, or the biometric prompt remains alive.
+fn bounded_helper_output(
+    binary: &Path,
+    args: &[&str],
+    timeout: Duration,
+    operation: &str,
+) -> Result<Output> {
+    let mut child = Command::new(binary)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| Error::Backend(format!("pay.sh: {e}")))?;
+
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|e| Error::Backend(format!("pay.sh: {e}")));
+            }
+            Ok(None) if started.elapsed() >= timeout => {
+                let killed = child.kill();
+                let reaped = child.wait();
+                if let Err(e) = killed {
+                    return Err(Error::Backend(format!(
+                        "{operation} timed out; failed to stop pay.sh: {e}"
+                    )));
+                }
+                reaped.map_err(|e| Error::Backend(format!("Failed to reap pay.sh: {e}")))?;
+                return Err(Error::Backend(format!(
+                    "{operation} timed out after {} seconds; the local approval prompt may not be visible",
+                    timeout.as_secs()
+                )));
+            }
+            Ok(None) => std::thread::sleep(HELPER_POLL_INTERVAL),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Backend(format!("pay.sh: {e}")));
+            }
         }
     }
 }
@@ -505,6 +599,75 @@ fn extract_error(stderr: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn touch_id_requires_a_local_graphical_security_session() {
+        assert!(session_can_show_touch_id(0, SESSION_HAS_GRAPHIC_ACCESS));
+        assert!(!session_can_show_touch_id(1, SESSION_HAS_GRAPHIC_ACCESS));
+        assert!(!session_can_show_touch_id(0, 0));
+        assert!(!session_can_show_touch_id(
+            0,
+            SESSION_HAS_GRAPHIC_ACCESS | SESSION_IS_REMOTE
+        ));
+    }
+
+    #[test]
+    fn bounded_helper_preserves_success_and_failure_status() {
+        let output = bounded_helper_output(
+            Path::new("/bin/echo"),
+            &["yes"],
+            Duration::from_secs(2),
+            "test helper",
+        )
+        .expect("helper should finish");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"yes\n");
+
+        let output = bounded_helper_output(
+            Path::new("/usr/bin/false"),
+            &[],
+            Duration::from_secs(2),
+            "test helper",
+        )
+        .expect("failed helper should return its status");
+        assert!(!output.status.success());
+    }
+
+    #[test]
+    fn bounded_helper_kills_and_reaps_a_stuck_process() {
+        let dir = test_dir("timeout");
+        let script = dir.path().join("hang.sh");
+        let pid_file = dir.path().join("pid");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec /bin/sleep 60\n",
+                pid_file.display()
+            ),
+        )
+        .expect("write test helper");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
+            .expect("set helper permissions");
+
+        let started = Instant::now();
+        let err = bounded_helper_output(
+            &script,
+            &[],
+            Duration::from_secs(1),
+            "Touch ID authentication",
+        )
+        .expect_err("stuck helper must time out");
+        assert!(err.to_string().contains("Touch ID authentication timed out"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let pid = fs::read_to_string(&pid_file).expect("helper started");
+        let still_running = Command::new("/bin/kill")
+            .args(["-0", pid.trim()])
+            .status()
+            .expect("probe helper PID")
+            .success();
+        assert!(!still_running, "timed-out helper must be reaped");
+    }
 
     struct TestDir(PathBuf);
 
